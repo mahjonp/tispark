@@ -21,32 +21,37 @@ import static com.pingcap.tikv.util.BackOffFunction.BackOffFuncType.BoRegionMiss
 
 import com.google.protobuf.ByteString;
 import com.pingcap.tikv.AbstractGRPCClient;
-import com.pingcap.tikv.TiSession;
+import com.pingcap.tikv.TiConfiguration;
 import com.pingcap.tikv.exception.KeyException;
 import com.pingcap.tikv.exception.RegionException;
 import com.pingcap.tikv.operation.KVErrorHandler;
 import com.pingcap.tikv.region.RegionErrorReceiver;
+import com.pingcap.tikv.region.RegionManager;
 import com.pingcap.tikv.region.TiRegion;
 import com.pingcap.tikv.region.TiRegion.RegionVerID;
 import com.pingcap.tikv.util.BackOffer;
+import com.pingcap.tikv.util.ChannelFactory;
 import com.pingcap.tikv.util.TsoUtils;
 import io.grpc.ManagedChannel;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.Map;
+import java.util.Queue;
+import java.util.Set;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.Supplier;
 import org.apache.log4j.Logger;
-import org.tikv.kvproto.Kvrpcpb.CleanupRequest;
-import org.tikv.kvproto.Kvrpcpb.CleanupResponse;
-import org.tikv.kvproto.Kvrpcpb.ResolveLockRequest;
-import org.tikv.kvproto.Kvrpcpb.ResolveLockResponse;
-import org.tikv.kvproto.Metapb.Store;
+import org.tikv.kvproto.Kvrpcpb;
+import org.tikv.kvproto.Metapb;
 import org.tikv.kvproto.TikvGrpc;
-import org.tikv.kvproto.TikvGrpc.TikvBlockingStub;
-import org.tikv.kvproto.TikvGrpc.TikvStub;
 
 // LockResolver resolves locks and also caches resolved txn status.
-public class LockResolverClient extends AbstractGRPCClient<TikvBlockingStub, TikvStub>
+public class LockResolverClient
+    extends AbstractGRPCClient<TikvGrpc.TikvBlockingStub, TikvGrpc.TikvStub>
     implements RegionErrorReceiver {
   // ResolvedCacheSize is max number of cached txn status.
   private static final long RESOLVED_TXN_CACHE_SIZE = 2048;
@@ -68,16 +73,23 @@ public class LockResolverClient extends AbstractGRPCClient<TikvBlockingStub, Tik
   private final Map<Long, Long> resolved;
   // the list is chain of txn for O(1) lru cache
   private final Queue<Long> recentResolved;
-  private TikvBlockingStub blockingStub;
-  private TikvStub asyncStub;
+  private TikvGrpc.TikvBlockingStub blockingStub;
+  private TikvGrpc.TikvStub asyncStub;
   private TiRegion region;
+  private final RegionManager regionManager;
 
-  public LockResolverClient(TiSession session, TikvBlockingStub blockingStub, TikvStub asyncStub) {
-    super(session);
+  public LockResolverClient(
+      TiConfiguration conf,
+      TikvGrpc.TikvBlockingStub blockingStub,
+      TikvGrpc.TikvStub asyncStub,
+      ChannelFactory channelFactory,
+      RegionManager regionManager) {
+    super(conf, channelFactory);
     resolved = new HashMap<>();
     recentResolved = new LinkedList<>();
     readWriteLock = new ReentrantReadWriteLock();
     this.blockingStub = blockingStub;
+    this.regionManager = regionManager;
     this.asyncStub = asyncStub;
   }
 
@@ -117,23 +129,24 @@ public class LockResolverClient extends AbstractGRPCClient<TikvBlockingStub, Tik
 
     while (true) {
       // refresh region
-      region = session.getRegionManager().getRegionByKey(primary);
+      region = regionManager.getRegionByKey(primary);
 
-      Supplier<CleanupRequest> factory =
+      Supplier<Kvrpcpb.CleanupRequest> factory =
           () ->
-              CleanupRequest.newBuilder()
+              Kvrpcpb.CleanupRequest.newBuilder()
                   .setContext(region.getContext())
                   .setKey(primary)
                   .setStartVersion(txnID)
                   .build();
-      KVErrorHandler<CleanupResponse> handler =
+      KVErrorHandler<Kvrpcpb.CleanupResponse> handler =
           new KVErrorHandler<>(
-              session.getRegionManager(),
+              regionManager,
               this,
               region,
               resp -> resp.hasRegionError() ? resp.getRegionError() : null);
 
-      CleanupResponse resp = callWithRetry(bo, TikvGrpc.METHOD_KV_CLEANUP, factory, handler);
+      Kvrpcpb.CleanupResponse resp =
+          callWithRetry(bo, TikvGrpc.METHOD_KV_CLEANUP, factory, handler);
 
       status = 0L;
       if (resp.hasRegionError()) {
@@ -197,19 +210,19 @@ public class LockResolverClient extends AbstractGRPCClient<TikvBlockingStub, Tik
   private void resolveLock(BackOffer bo, Lock lock, long txnStatus, Set<RegionVerID> cleanRegion) {
 
     while (true) {
-      region = session.getRegionManager().getRegionByKey(lock.getKey());
+      region = regionManager.getRegionByKey(lock.getKey());
 
       if (cleanRegion.contains(region.getVerID())) {
         return;
       }
 
-      Supplier<ResolveLockRequest> factory;
+      Supplier<Kvrpcpb.ResolveLockRequest> factory;
 
       if (txnStatus > 0) {
         // txn is committed with commitTS txnStatus
         factory =
             () ->
-                ResolveLockRequest.newBuilder()
+                Kvrpcpb.ResolveLockRequest.newBuilder()
                     .setContext(region.getContext())
                     .setStartVersion(lock.getTxnID())
                     .setCommitVersion(txnStatus)
@@ -217,20 +230,20 @@ public class LockResolverClient extends AbstractGRPCClient<TikvBlockingStub, Tik
       } else {
         factory =
             () ->
-                ResolveLockRequest.newBuilder()
+                Kvrpcpb.ResolveLockRequest.newBuilder()
                     .setContext(region.getContext())
                     .setStartVersion(lock.getTxnID())
                     .build();
       }
 
-      KVErrorHandler<ResolveLockResponse> handler =
+      KVErrorHandler<Kvrpcpb.ResolveLockResponse> handler =
           new KVErrorHandler<>(
-              session.getRegionManager(),
+              regionManager,
               this,
               region,
               resp -> resp.hasRegionError() ? resp.getRegionError() : null);
 
-      ResolveLockResponse resp =
+      Kvrpcpb.ResolveLockResponse resp =
           callWithRetry(bo, TikvGrpc.METHOD_KV_RESOLVE_LOCK, factory, handler);
 
       if (resp.hasError()) {
@@ -250,12 +263,12 @@ public class LockResolverClient extends AbstractGRPCClient<TikvBlockingStub, Tik
   }
 
   @Override
-  protected TikvBlockingStub getBlockingStub() {
+  protected TikvGrpc.TikvBlockingStub getBlockingStub() {
     return blockingStub.withDeadlineAfter(getConf().getTimeout(), getConf().getTimeoutUnit());
   }
 
   @Override
-  protected TikvStub getAsyncStub() {
+  protected TikvGrpc.TikvStub getAsyncStub() {
     return asyncStub.withDeadlineAfter(getConf().getTimeout(), getConf().getTimeoutUnit());
   }
 
@@ -269,39 +282,30 @@ public class LockResolverClient extends AbstractGRPCClient<TikvBlockingStub, Tik
    * @return false when re-split is needed.
    */
   @Override
-  public boolean onNotLeader(Store newStore) {
+  public boolean onNotLeader(Metapb.Store newStore) {
     if (logger.isDebugEnabled()) {
       logger.debug(region + ", new leader = " + newStore.getId());
     }
-    TiRegion cachedRegion = getSession().getRegionManager().getRegionById(region.getId());
+    TiRegion cachedRegion = regionManager.getRegionById(region.getId());
     // When switch leader fails or the region changed its key range,
     // it would be necessary to re-split task's key range for new region.
-    if (!region.switchPeer(newStore.getId())
-        || !region.getStartKey().equals(cachedRegion.getStartKey())
+    if (!region.getStartKey().equals(cachedRegion.getStartKey())
         || !region.getEndKey().equals(cachedRegion.getEndKey())) {
       return false;
     }
+    region = cachedRegion;
     String addressStr = newStore.getAddress();
-    ManagedChannel channel = getSession().getChannel(addressStr);
+    ManagedChannel channel = channelFactory.getChannel(addressStr);
     blockingStub = TikvGrpc.newBlockingStub(channel);
     asyncStub = TikvGrpc.newStub(channel);
     return true;
   }
 
   @Override
-  public void onStoreNotMatch(Store store) {
+  public void onStoreNotMatch(Metapb.Store store) {
     String addressStr = store.getAddress();
-    ManagedChannel channel = getSession().getChannel(addressStr);
+    ManagedChannel channel = channelFactory.getChannel(addressStr);
     blockingStub = TikvGrpc.newBlockingStub(channel);
     asyncStub = TikvGrpc.newStub(channel);
-    if (logger.isDebugEnabled() && region.getLeader().getStoreId() != store.getId()) {
-      logger.debug(
-          "store_not_match may occur? "
-              + region
-              + ", original store = "
-              + store.getId()
-              + " address = "
-              + addressStr);
-    }
   }
 }

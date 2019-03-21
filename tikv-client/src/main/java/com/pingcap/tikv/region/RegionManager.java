@@ -222,9 +222,12 @@ public class RegionManager {
   /**
    * Clears all cache when a TiKV server does not respond
    *
-   * @param regionId region's id
-   * @param storeId TiKV store's id
+   * @param region region
    */
+  public void onRequestFail(TiRegion region) {
+    onRequestFail(region.getId(), region.getLeader().getStoreId());
+  }
+
   public void onRequestFail(long regionId, long storeId) {
     cache.invalidateRegion(regionId);
     cache.invalidateAllRegionForStore(storeId);

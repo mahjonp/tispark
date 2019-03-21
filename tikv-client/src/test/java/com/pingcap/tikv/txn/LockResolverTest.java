@@ -31,9 +31,11 @@ import com.pingcap.tikv.exception.KeyException;
 import com.pingcap.tikv.exception.RegionException;
 import com.pingcap.tikv.meta.TiTimestamp;
 import com.pingcap.tikv.operation.KVErrorHandler;
+import com.pingcap.tikv.region.RegionManager;
 import com.pingcap.tikv.region.RegionStoreClient;
 import com.pingcap.tikv.region.TiRegion;
 import com.pingcap.tikv.util.BackOffer;
+import com.pingcap.tikv.util.ChannelFactory;
 import com.pingcap.tikv.util.ConcreteBackOffer;
 import com.pingcap.tikv.util.Pair;
 import java.lang.reflect.Field;
@@ -84,7 +86,7 @@ public class LockResolverTest {
     for (Mutation m : mutations) {
       Pair<TiRegion, Store> pair = session.getRegionManager().getRegionStorePairByKey(m.getKey());
 
-      RegionStoreClient client = RegionStoreClient.create(pair.first, pair.second, session);
+      RegionStoreClient client = builder.build(pair.first);
 
       Supplier<PrewriteRequest> factory =
           () ->
@@ -192,7 +194,7 @@ public class LockResolverTest {
     for (ByteString k : keys) {
       Pair<TiRegion, Store> pair = session.getRegionManager().getRegionStorePairByKey(k);
 
-      RegionStoreClient client = RegionStoreClient.create(pair.first, pair.second, session);
+      RegionStoreClient client = builder.build(pair.first);
       Supplier<CommitRequest> factory =
           () ->
               CommitRequest.newBuilder()
@@ -257,12 +259,17 @@ public class LockResolverTest {
     assertTrue(lockKey("d", "dd", "z2", "z2", false, startTs.getVersion(), endTs.getVersion()));
   }
 
+  private RegionStoreClient.RegionStoreClientBuilder builder;
+  private RegionManager regionManager;
+
   @Before
   public void setUp() {
     TiConfiguration conf = TiConfiguration.createDefault("127.0.0.1:2379");
     try {
       session = TiSession.create(conf);
       pdClient = PDClient.create(session);
+      this.regionManager = new RegionManager(pdClient);
+      this.builder = session.getRegionStoreClientBuilder();
       init = true;
     } catch (Exception e) {
       logger.warn("TiDB cluster may not be present");
@@ -293,7 +300,7 @@ public class LockResolverTest {
           session
               .getRegionManager()
               .getRegionStorePairByKey(ByteString.copyFromUtf8(String.valueOf((char) ('a' + i))));
-      RegionStoreClient client = RegionStoreClient.create(pair.first, pair.second, session);
+      RegionStoreClient client = builder.build(pair.first);
       ByteString v =
           client.get(
               backOffer,
@@ -358,7 +365,7 @@ public class LockResolverTest {
           session
               .getRegionManager()
               .getRegionStorePairByKey(ByteString.copyFromUtf8(String.valueOf((char) ('a' + i))));
-      RegionStoreClient client = RegionStoreClient.create(pair.first, pair.second, session);
+      RegionStoreClient client = builder.build(pair.first);
       ByteString v =
           client.get(
               backOffer,
@@ -385,7 +392,7 @@ public class LockResolverTest {
         session
             .getRegionManager()
             .getRegionStorePairByKey(ByteString.copyFromUtf8(String.valueOf('a')));
-    RegionStoreClient client = RegionStoreClient.create(pair.first, pair.second, session);
+    RegionStoreClient client = builder.build(pair.first);
     long status =
         client.lockResolverClient.getTxnStatus(
             backOffer, startTs.getVersion(), ByteString.copyFromUtf8(String.valueOf('a')));
@@ -399,7 +406,7 @@ public class LockResolverTest {
         session
             .getRegionManager()
             .getRegionStorePairByKey(ByteString.copyFromUtf8(String.valueOf('a')));
-    client = RegionStoreClient.create(pair.first, pair.second, session);
+    client = builder.build(pair.first);
     status =
         client.lockResolverClient.getTxnStatus(
             backOffer, startTs.getVersion(), ByteString.copyFromUtf8(String.valueOf('a')));
@@ -413,7 +420,7 @@ public class LockResolverTest {
         session
             .getRegionManager()
             .getRegionStorePairByKey(ByteString.copyFromUtf8(String.valueOf('a')));
-    client = RegionStoreClient.create(pair.first, pair.second, session);
+    client = builder.build(pair.first);
     status =
         client.lockResolverClient.getTxnStatus(
             backOffer, startTs.getVersion(), ByteString.copyFromUtf8(String.valueOf('a')));
@@ -443,7 +450,7 @@ public class LockResolverTest {
         session
             .getRegionManager()
             .getRegionStorePairByKey(ByteString.copyFromUtf8(String.valueOf('a')));
-    RegionStoreClient client = RegionStoreClient.create(pair.first, pair.second, session);
+    RegionStoreClient client = builder.build(pair.first);
     ByteString v =
         client.get(
             backOffer,
@@ -484,7 +491,7 @@ public class LockResolverTest {
         session
             .getRegionManager()
             .getRegionStorePairByKey(ByteString.copyFromUtf8(String.valueOf('a')));
-    RegionStoreClient client = RegionStoreClient.create(pair.first, pair.second, session);
+    RegionStoreClient client = builder.build(pair.first);
     ByteString v =
         client.get(
             backOffer,

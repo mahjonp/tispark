@@ -15,21 +15,23 @@
 
 package com.pingcap.tispark
 
-import com.pingcap.tikv.TiBatchWriteUtils
+import com.pingcap.tikv._
 import com.pingcap.tikv.codec.KeyUtils
 import com.pingcap.tikv.key.{Key, RowKey}
+import com.pingcap.tikv.meta.TiTimestamp
 import com.pingcap.tikv.region.TiRegion
 import com.pingcap.tikv.row.ObjectRowImpl
-import com.pingcap.tikv.util.KeyRangeUtils
+import com.pingcap.tikv.txn.TxnKVClient
+import com.pingcap.tikv.util.{ConcreteBackOffer, KeyRangeUtils}
 import org.apache.spark.Partitioner
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.TiContext
 import org.slf4j.LoggerFactory
 
 /**
- * An ugly implementation of batch write framework, which will be
- * replaced by spark api.
- */
+  * An ugly implementation of batch write framework, which will be
+  * replaced by spark api.
+  */
 object TiBatchWrite {
   private final val logger = LoggerFactory.getLogger(getClass.getName)
 
@@ -38,6 +40,10 @@ object TiBatchWrite {
   type TiDataType = com.pingcap.tikv.types.DataType
 
   def writeToTiDB(rdd: RDD[SparkRow], tableRef: TiTableReference, tiContext: TiContext) {
+    // initialize
+    val tiConf = tiContext.tiConf
+    val kvClient = createTxnKVClient(tiConf)
+
     // TODO: region pre-split
     // pending: https://internal.pingcap.net/jira/browse/TISPARK-69
 
@@ -65,18 +71,52 @@ object TiBatchWrite {
     }
     logger.info(s"primary key: $primaryKey primary row: $primaryRow")
 
-    // TODO: get timestamp as start_ts
+    // filter primary key
+    val finalWriteRDD = shuffledRDD.filter {
+      case (key, row) => !key.equals(primaryKey)
+    }
 
-    // TODO: driver primary pre-write
+    // get timestamp as start_ts
+    val startTS = kvClient.getTimestamp
+    logger.info(s"startTS: $startTS")
 
-    // TODO: executors secondary pre-write
+    // driver primary pre-write
+    val ti2PCClient = create2PCClient(kvClient, startTS)
+    val prewritePrimaryBackoff = ConcreteBackOffer.newCustomBackOff(3000)
+    ti2PCClient.prewritePrimaryKey(prewritePrimaryBackoff, primaryKey.bytes, encodeTiRow(primaryRow))
 
-    // TODO: driver primary commit
+    // executors secondary pre-write
+    finalWriteRDD.foreachPartition { case iterator =>
+      val kvClientOnExecutor = createTxnKVClient(tiConf)
+      val ti2PCClientOnExecutor = create2PCClient(kvClientOnExecutor, startTS)
+      val prewriteSecondaryBackoff = ConcreteBackOffer.newCustomBackOff(3000)
 
-    // TODO: executors secondary commit
+      import scala.collection.JavaConverters._
+      val keys = iterator.map { case (key, row) => new TiBatchWrite2PCClient.ByteWrapper(key.bytes) }.asJava
+
+      val values = iterator.map { case (key, row) => new TiBatchWrite2PCClient.ByteWrapper(encodeTiRow(row)) }.asJava
+
+      ti2PCClientOnExecutor.prewriteSecondaryKeys(prewriteSecondaryBackoff, keys, values)
+    }
+
+    // driver primary commit
+    val commitPrimaryBackoff = ConcreteBackOffer.newCustomBackOff(3000)
+    ti2PCClient.commitPrimaryKey(commitPrimaryBackoff, primaryKey.bytes)
+
+    // executors secondary commit
+    finalWriteRDD.foreachPartition { case iterator =>
+      val kvClientOnExecutor = createTxnKVClient(tiConf)
+      val ti2PCClientOnExecutor = create2PCClient(kvClientOnExecutor, startTS)
+      val commitSecondaryBackoff = ConcreteBackOffer.newCustomBackOff(3000)
+
+      import scala.collection.JavaConverters._
+      val keys = iterator.map { case (key, row) => new TiBatchWrite2PCClient.ByteWrapper(key.bytes) }.asJava
+
+      ti2PCClientOnExecutor.commitSecondaryKeys(commitSecondaryBackoff, keys)
+    }
 
     // print for test
-    shuffledRDD.foreachPartition { iterator =>
+    finalWriteRDD.foreachPartition { iterator =>
       println("==partition begin==")
       iterator.foreach {
         case (key, row) =>
@@ -84,6 +124,16 @@ object TiBatchWrite {
       }
     }
 
+  }
+
+  private def create2PCClient(kVClient: TxnKVClient, startTS: TiTimestamp): TiBatchWrite2PCClient = {
+    new TiBatchWrite2PCClient(kVClient, startTS.getPhysical)
+  }
+
+  private def createTxnKVClient(tiConf: TiConfiguration): TxnKVClient = {
+    val session = new TiSession(tiConf)
+    val pdClient = PDClient.create(session)
+    new TxnKVClient(tiConf, session.getRegionStoreClientBuilder, pdClient)
   }
 
   private def shuffleToSameRegion(rdd: RDD[TiRow],
@@ -138,6 +188,11 @@ object TiBatchWrite {
     }
     tiRow
   }
+
+  private def encodeTiRow(tiRow: TiRow): Array[Byte] = {
+    // TODO
+    null
+  }
 }
 
 class TiRegionPartitioner(regions: List[TiRegion]) extends Partitioner {
@@ -161,6 +216,12 @@ class TiRegionPartitioner(regions: List[TiRegion]) extends Partitioner {
 }
 
 class SerializableKey(val bytes: Array[Byte]) extends Serializable {
-  override def toString: String =
-    KeyUtils.formatBytes(bytes)
+  override def toString: String = KeyUtils.formatBytes(bytes)
+
+  override def equals(that: Any): Boolean = {
+    that match {
+      case that: SerializableKey => this.bytes.sameElements(that.bytes)
+      case _ => false
+    }
+  }
 }

@@ -15,12 +15,15 @@
 
 package com.pingcap.tikv;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.util.concurrent.ThreadFactoryBuilder;
 import com.pingcap.tikv.catalog.Catalog;
 import com.pingcap.tikv.event.CacheInvalidateEvent;
 import com.pingcap.tikv.meta.TiTimestamp;
 import com.pingcap.tikv.pd.PDUtils;
 import com.pingcap.tikv.region.RegionManager;
+import com.pingcap.tikv.region.RegionStoreClient;
+import com.pingcap.tikv.util.ChannelFactory;
 import com.pingcap.tikv.util.ConcreteBackOffer;
 import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
@@ -35,6 +38,7 @@ import java.util.function.Function;
 public class TiSession implements AutoCloseable {
   private static final Map<String, ManagedChannel> connPool = new HashMap<>();
   private final TiConfiguration conf;
+  private final ChannelFactory channelFactory;
   private Function<CacheInvalidateEvent, Void> cacheInvalidateCallback;
   // below object creation is either heavy or making connection (pd), pending for lazy loading
   private volatile RegionManager regionManager;
@@ -43,8 +47,18 @@ public class TiSession implements AutoCloseable {
   private volatile ExecutorService indexScanThreadPool;
   private volatile ExecutorService tableScanThreadPool;
 
+  private final RegionStoreClient.RegionStoreClientBuilder clientBuilder;
+
   public TiSession(TiConfiguration conf) {
     this.conf = conf;
+    this.channelFactory = new ChannelFactory(conf.getMaxFrameSize());
+    this.clientBuilder =
+        new RegionStoreClient.RegionStoreClientBuilder(
+            conf, this.channelFactory, new RegionManager(this.getPDClient()), this);
+  }
+
+  public RegionStoreClient.RegionStoreClientBuilder getRegionStoreClientBuilder() {
+    return this.clientBuilder;
   }
 
   public TiConfiguration getConf() {
@@ -184,5 +198,10 @@ public class TiSession implements AutoCloseable {
   public void close() throws Exception {
     getThreadPoolForTableScan().shutdownNow();
     getThreadPoolForIndexScan().shutdownNow();
+  }
+
+  @VisibleForTesting
+  public ChannelFactory getChannelFactory() {
+    return channelFactory;
   }
 }

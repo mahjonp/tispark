@@ -19,7 +19,7 @@ import com.pingcap.tispark.{TiBatchWrite, TiTableReference}
 import org.apache.spark.rdd.RDD
 import org.scalatest.Ignore
 
-@Ignore
+//@Ignore
 class TiBatchWriteSuite extends BaseTiSparkSuite {
   test("ti batch write") {
     sql("show databases").show()
